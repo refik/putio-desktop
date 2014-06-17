@@ -1,20 +1,20 @@
 package main
 
 import (
-	"os"
+    "os"
     "io"
     "fmt"
-	"log"
+    "log"
     "time"
     "flag"
-	"path"
+    "path"
     "sync"
     "syscall"
-	"strconv"
-	"net/url"
-	"net/http"
-	"io/ioutil"
-	"encoding/json"
+    "strconv"
+    "net/url"
+    "net/http"
+    "io/ioutil"
+    "encoding/json"
 )
 
 // Settings
