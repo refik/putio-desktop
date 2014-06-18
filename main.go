@@ -195,6 +195,13 @@ func FillWithZeros(fp *os.File, remainingWrite int) error {
 func DownloadChunk(file *File, fp *os.File, offset int, size int, chunkWg *sync.WaitGroup, fileLock *sync.Mutex) {
 	newOffset := offset
 
+	retry := func(err error) {
+		chunkWg.Add(1)
+		log.Println(err)
+		written := newOffset - offset
+		go DownloadChunk(file, fp, newOffset, size-written, chunkWg, fileLock)
+	}
+
 	// Creating a custom request because it will have Range header in it
 	req, _ := http.NewRequest("GET", file.DownloadUrl(), nil)
 
@@ -227,16 +234,15 @@ func DownloadChunk(file *File, fp *os.File, offset int, size int, chunkWg *sync.
 			fileLock.Unlock()
 			newOffset += nw
 			if ew != nil {
-				log.Println(ew)
-				written := newOffset - offset
-				go DownloadChunk(file, fp, newOffset, size-written, chunkWg, fileLock)
+				retry(ew)
+				break
 			}
 		}
 		if er == io.EOF {
 			break
 		}
 		if er != nil {
-			log.Println(er)
+			retry(er)
 			break
 		}
 	}
