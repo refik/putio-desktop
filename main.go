@@ -13,7 +13,6 @@ import (
 	"path"
 	"strconv"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -23,7 +22,8 @@ var RemoteFolderName = flag.String("putio-folder", "", "putio folder name under 
 var AccessToken = flag.String("oauth-token", "", "Oauth Token")
 var LocalFolderPath = flag.String("local-path", "", "local folder to fetch")
 
-const ApiUrl = "https://api.put.io/v2/"
+var ApiUrl = "https://api.put.io/v2/"
+
 const DownloadExtension = ".putiodl"
 const MaxConnection = 10
 
@@ -41,14 +41,14 @@ type File struct {
 
 func (file *File) DownloadUrl() string {
 	method := "files/" + strconv.Itoa(file.Id) + "/download"
-	return MakeUrl(method, map[string]string{})
+	return MakeUrl(method, &map[string]string{})
 }
 
 // Utility functions
-func ParamsWithAuth(params map[string]string) string {
+func ParamsWithAuth(params *map[string]string) string {
 	newParams := url.Values{}
 
-	for k, v := range params {
+	for k, v := range *params {
 		newParams.Add(k, v)
 	}
 
@@ -56,7 +56,7 @@ func ParamsWithAuth(params map[string]string) string {
 	return newParams.Encode()
 }
 
-func MakeUrl(method string, params map[string]string) string {
+func MakeUrl(method string, params *map[string]string) string {
 	newParams := ParamsWithAuth(params)
 	return ApiUrl + method + "?" + newParams
 }
@@ -77,7 +77,7 @@ func SaveRemoteFolderId() {
 
 func FilesListRequest(parentId int) []File {
 	// Preparing url
-	params := map[string]string{"parent_id": strconv.Itoa(parentId)}
+	params := &map[string]string{"parent_id": strconv.Itoa(parentId)}
 	folderUrl := MakeUrl("files/list", params)
 
 	log.Println(folderUrl)
@@ -117,14 +117,13 @@ func WalkAndDownload(parentId int, folderPath string) {
 		} else {
 			if _, err := os.Stat(path); err != nil {
 				log.Println(err)
-				DownloadFile(&file, path)
+				go DownloadFile(&file, path)
 			}
 		}
 	}
 }
 
-func DownloadChunk(file *File, fp *os.File, offset int,
-	size int, chunkWg *sync.WaitGroup) {
+func DownloadChunk(file *File, fp *os.File, offset int, size int, chunkWg *sync.WaitGroup, fileLock *sync.Mutex) {
 	defer chunkWg.Done()
 	log.Println("Downloading chunk starting from:", offset, "bytes:", size)
 
@@ -133,11 +132,20 @@ func DownloadChunk(file *File, fp *os.File, offset int,
 		log.Fatal(err)
 	}
 
-	rangeHeader := fmt.Sprintf("bytes=%d-%d\r\n", offset, offset+size)
-	log.Println(rangeHeader)
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+size)
 	req.Header.Add("Range", rangeHeader)
+	log.Println(rangeHeader)
+	log.Println(req.Header)
 
-	resp, err := http.DefaultClient.Do(req)
+	// http.DefaultClient does not copy headers while following redirects
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			req.Header.Add("Range", rangeHeader)
+			return nil
+		},
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -147,7 +155,10 @@ func DownloadChunk(file *File, fp *os.File, offset int,
 	for {
 		nr, er := resp.Body.Read(buffer)
 		if nr > 0 {
-			nw, ew := fp.WriteAt(buffer[0:nr], int64(offset))
+			fileLock.Lock()
+			fp.Seek(int64(offset), os.SEEK_SET)
+			nw, ew := fp.Write(buffer[0:nr])
+			fileLock.Unlock()
 			offset += nw
 			if ew != nil {
 				log.Fatal(ew)
@@ -164,10 +175,26 @@ func DownloadChunk(file *File, fp *os.File, offset int,
 	}
 }
 
+func FillWithZeros(fp *os.File, remainingWrite int) {
+	var write int
+	chunkSize := 3 * 1024
+	zeros := make([]byte, chunkSize)
+	for remainingWrite > 0 {
+		if remainingWrite < chunkSize {
+			write = remainingWrite
+		} else {
+			write = chunkSize
+		}
+		fp.Write(zeros[0:write])
+		remainingWrite -= write
+	}
+}
+
 func DownloadFile(file *File, path string) {
 	// Creating a waitgroup to wait for all chunks to be
 	// downloaded before exiting
 	var chunkWg sync.WaitGroup
+	var fileLock sync.Mutex
 
 	fp, err := os.Create(path + DownloadExtension)
 	if err != nil {
@@ -176,7 +203,7 @@ func DownloadFile(file *File, path string) {
 	defer fp.Close()
 
 	// Allocating space for the file
-	syscall.Fallocate(int(fp.Fd()), 0, 0, int64(file.Size))
+	FillWithZeros(fp, file.Size)
 
 	chunkSize := file.Size / MaxConnection
 	excessBytes := file.Size % MaxConnection
@@ -190,7 +217,7 @@ func DownloadFile(file *File, path string) {
 			chunkSize += excessBytes
 		}
 		chunkWg.Add(1)
-		go DownloadChunk(file, fp, offset, chunkSize, &chunkWg)
+		go DownloadChunk(file, fp, offset, chunkSize, &chunkWg, &fileLock)
 		offset += chunkSize
 	}
 	chunkWg.Wait()
@@ -204,16 +231,13 @@ func DownloadFile(file *File, path string) {
 	log.Println("Download completed")
 }
 
-func init() {
+func main() {
 	flag.Parse()
 	SaveRemoteFolderId()
-}
-
-func main() {
 	log.Println("Starting...")
 
 	for {
-		WalkAndDownload(RemoteFolderId, *LocalFolderPath)
+		go WalkAndDownload(RemoteFolderId, *LocalFolderPath)
 		time.Sleep(10 * time.Minute)
 	}
 
