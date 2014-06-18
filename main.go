@@ -22,7 +22,7 @@ var RemoteFolderId int
 var RemoteFolderName = flag.String("putio-folder", "Putio Desktop", "putio folder name under your root")
 var AccessToken = flag.String("oauth-token", "", "Oauth Token")
 var LocalFolderPath = flag.String("local-path", "home/Putio Desktop", "local folder to fetch")
-var CheckInterval = flag.Int("check-minutes", 5, "check interval of remote files in put.io")
+var CheckInterval = flag.Int("check-minutes", 10, "check interval of remote files in put.io")
 var ApiUrl = "https://api.put.io/v2/"
 
 const DownloadExtension = ".putiodl"
@@ -46,14 +46,14 @@ type File struct {
 
 func (file *File) DownloadUrl() string {
 	method := "files/" + strconv.Itoa(file.Id) + "/download"
-	return MakeUrl(method, &map[string]string{})
+	return MakeUrl(method, map[string]string{})
 }
 
 // Utility functions
-func ParamsWithAuth(params *map[string]string) string {
+func ParamsWithAuth(params map[string]string) string {
 	newParams := url.Values{}
 
-	for k, v := range *params {
+	for k, v := range params {
 		newParams.Add(k, v)
 	}
 
@@ -61,7 +61,7 @@ func ParamsWithAuth(params *map[string]string) string {
 	return newParams.Encode()
 }
 
-func MakeUrl(method string, params *map[string]string) string {
+func MakeUrl(method string, params map[string]string) string {
 	newParams := ParamsWithAuth(params)
 	return ApiUrl + method + "?" + newParams
 }
@@ -79,7 +79,7 @@ func GetRemoteFolderId() int {
 		}
 	}
 
-	postUrl := MakeUrl("files/create-folder", &map[string]string{})
+	postUrl := MakeUrl("files/create-folder", map[string]string{})
 	postValues := url.Values{}
 	postValues.Add("name", *RemoteFolderName)
 	postValues.Add("parent_id", "0")
@@ -106,7 +106,7 @@ func GetRemoteFolderId() int {
 
 func FilesListRequest(parentId int) []File {
 	// Preparing url
-	params := &map[string]string{"parent_id": strconv.Itoa(parentId)}
+	params := map[string]string{"parent_id": strconv.Itoa(parentId)}
 	folderUrl := MakeUrl("files/list", params)
 
 	log.Println(folderUrl)
