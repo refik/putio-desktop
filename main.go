@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/user"
 	"path"
 	"strconv"
 	"sync"
@@ -18,10 +19,10 @@ import (
 
 // Settings
 var RemoteFolderId int
-var RemoteFolderName = flag.String("putio-folder", "", "putio folder name under your root")
+var RemoteFolderName = flag.String("putio-folder", "Putio Desktop", "putio folder name under your root")
 var AccessToken = flag.String("oauth-token", "", "Oauth Token")
-var LocalFolderPath = flag.String("local-path", "", "local folder to fetch")
-
+var LocalFolderPath = flag.String("local-path", "home/Putio Desktop", "local folder to fetch")
+var CheckInterval = flag.Int("check-minutes", 5, "check interval of remote files in put.io")
 var ApiUrl = "https://api.put.io/v2/"
 
 const DownloadExtension = ".putiodl"
@@ -30,6 +31,10 @@ const MaxConnection = 10
 // Putio api response types
 type FilesResponse struct {
 	Files []File `json:"files"`
+}
+
+type FileResponse struct {
+	File File `json:"file"`
 }
 
 type File struct {
@@ -61,18 +66,42 @@ func MakeUrl(method string, params *map[string]string) string {
 	return ApiUrl + method + "?" + newParams
 }
 
-func SaveRemoteFolderId() {
+func GetRemoteFolderId() int {
 	// Making sure this folder exits. Creating if necessary
 	// and updating global variable
 	files := FilesListRequest(0)
-	log.Println(files)
+
 	// Looping through files to get the putitin folder
 	for _, file := range files {
 		if file.Name == *RemoteFolderName {
-			log.Println("Found putitin folder")
-			RemoteFolderId = file.Id
+			log.Println("Found remote folder")
+			return file.Id
 		}
 	}
+
+	postUrl := MakeUrl("files/create-folder", &map[string]string{})
+	postValues := url.Values{}
+	postValues.Add("name", *RemoteFolderName)
+	postValues.Add("parent_id", "0")
+	resp, err := http.PostForm(postUrl, postValues)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
+	fileResponse := FileResponse{}
+	err = json.Unmarshal(body, &fileResponse)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	folderId := fileResponse.File.Id
+	log.Println("Remote folder ID:", fileResponse.File)
+	return folderId
 }
 
 func FilesListRequest(parentId int) []File {
@@ -200,7 +229,6 @@ func DownloadFile(file *File, path string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer fp.Close()
 
 	// Allocating space for the file
 	FillWithZeros(fp, file.Size)
@@ -211,12 +239,12 @@ func DownloadFile(file *File, path string) {
 	log.Println("Chunk size:", chunkSize, "Excess:", excessBytes)
 
 	offset := 0
+	chunkWg.Add(MaxConnection)
 	for i := MaxConnection; i > 0; i-- {
 		if i == 1 {
 			// Add excess bytes to last connection
 			chunkSize += excessBytes
 		}
-		chunkWg.Add(1)
 		go DownloadChunk(file, fp, offset, chunkSize, &chunkWg, &fileLock)
 		offset += chunkSize
 	}
@@ -233,12 +261,17 @@ func DownloadFile(file *File, path string) {
 
 func main() {
 	flag.Parse()
-	SaveRemoteFolderId()
+	RemoteFolderId := GetRemoteFolderId()
+	if *LocalFolderPath == "home/Putio Desktop" {
+		user, _ := user.Current()
+		defaultPath := path.Join(user.HomeDir, "Putio Desktop")
+		LocalFolderPath = &defaultPath
+	}
 	log.Println("Starting...")
 
 	for {
 		go WalkAndDownload(RemoteFolderId, *LocalFolderPath)
-		time.Sleep(10 * time.Minute)
+		time.Sleep(time.Duration(*CheckInterval) * time.Minute)
 	}
 
 	log.Println("Exiting...")
