@@ -18,17 +18,22 @@ import (
 )
 
 // Settings
-var RemoteFolderId int
+
 var RemoteFolderName = flag.String("putio-folder", "Putio Desktop", "putio folder name under your root")
 var AccessToken = flag.String("oauth-token", "", "Oauth Token")
 var LocalFolderPath = flag.String("local-path", "home/Putio Desktop", "local folder to fetch")
 var CheckInterval = flag.Int("check-minutes", 10, "check interval of remote files in put.io")
-var ApiUrl = "https://api.put.io/v2/"
 
-const DownloadExtension = ".putiodl"
+const ApiUrl = "https://api.put.io/v2/"
+const DownloadExtension = ".putio-desktop"
 const MaxConnection = 10
 
+// Globals
+
+var RemoteFolderId int
+
 // Putio api response types
+
 type FilesResponse struct {
 	Files []File `json:"files"`
 }
@@ -49,7 +54,8 @@ func (file *File) DownloadUrl() string {
 	return MakeUrl(method, map[string]string{})
 }
 
-// Utility functions
+// Api request functions
+
 func ParamsWithAuth(params map[string]string) string {
 	newParams := url.Values{}
 
@@ -66,16 +72,19 @@ func MakeUrl(method string, params map[string]string) string {
 	return ApiUrl + method + "?" + newParams
 }
 
-func GetRemoteFolderId() int {
+func GetRemoteFolderId() (folderId int, err error) {
 	// Making sure this folder exits. Creating if necessary
 	// and updating global variable
-	files := FilesListRequest(0)
+	files, err := FilesListRequest(0)
+	if err != nil {
+		return
+	}
 
 	// Looping through files to get the putitin folder
 	for _, file := range files {
 		if file.Name == *RemoteFolderName {
 			log.Println("Found remote folder")
-			return file.Id
+			return file.Id, nil
 		}
 	}
 
@@ -85,59 +94,67 @@ func GetRemoteFolderId() int {
 	postValues.Add("parent_id", "0")
 	resp, err := http.PostForm(postUrl, postValues)
 	if err != nil {
-		log.Fatal(err)
+		return
 	}
+	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
-	resp.Body.Close()
 	if err != nil {
-		log.Fatal(err)
+		return
 	}
+
 	fileResponse := FileResponse{}
 	err = json.Unmarshal(body, &fileResponse)
 	if err != nil {
-		log.Fatal(err)
+		return
 	}
 
-	folderId := fileResponse.File.Id
-	log.Println("Remote folder ID:", fileResponse.File)
-	return folderId
+	return fileResponse.File.Id, nil
 }
 
-func FilesListRequest(parentId int) []File {
+func FilesListRequest(parentId int) (files []File, err error) {
 	// Preparing url
 	params := map[string]string{"parent_id": strconv.Itoa(parentId)}
 	folderUrl := MakeUrl("files/list", params)
 
-	log.Println(folderUrl)
 	resp, err := http.Get(folderUrl)
 	if err != nil {
-		log.Fatal(err)
+		return
 	}
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		log.Fatal(err)
+		return
 	}
 	defer resp.Body.Close()
 
 	filesResponse := FilesResponse{}
-	json.Unmarshal(body, &filesResponse)
+	err = json.Unmarshal(body, &filesResponse)
+	if err != nil {
+		return
+	}
 
-	return filesResponse.Files
+	return filesResponse.Files, nil
 }
 
 func WalkAndDownload(parentId int, folderPath string) {
-	// Creating if the encapsulating folder is absent
+	log.Println("Walking in", folderPath)
+
+	// Creating if the folder is absent
 	if _, err := os.Stat(folderPath); err != nil {
 		err := os.Mkdir(folderPath, 0755)
 		if err != nil {
-			log.Fatal(err)
+			// Will try again at the next run
+			log.Println(err)
+			return
 		}
 	}
 
-	files := FilesListRequest(parentId)
-	log.Println("Walking in", folderPath)
+	files, err := FilesListRequest(parentId)
+	if err != nil {
+		log.Println(err)
+		return
+	}
 
 	for _, file := range files {
 		path := path.Join(folderPath, file.Name)
@@ -145,26 +162,44 @@ func WalkAndDownload(parentId int, folderPath string) {
 			go WalkAndDownload(file.Id, path)
 		} else {
 			if _, err := os.Stat(path); err != nil {
-				log.Println(err)
-				go DownloadFile(&file, path)
+				go DownloadFile(file, path)
 			}
 		}
 	}
 }
 
-func DownloadChunk(file *File, fp *os.File, offset int, size int, chunkWg *sync.WaitGroup, fileLock *sync.Mutex) {
-	defer chunkWg.Done()
-	log.Println("Downloading chunk starting from:", offset, "bytes:", size)
+// Local file operations
 
-	req, err := http.NewRequest("GET", file.DownloadUrl(), nil)
-	if err != nil {
-		log.Fatal(err)
+func FillWithZeros(fp *os.File, remainingWrite int) error {
+	var nWrite int // Next chunk size to write
+	chunkSize := 3 * 1024
+	zeros := make([]byte, chunkSize)
+	for remainingWrite > 0 {
+		// Checking whether there is less to write than chunkSize
+		if remainingWrite < chunkSize {
+			nWrite = remainingWrite
+		} else {
+			nWrite = chunkSize
+		}
+
+		_, err := fp.Write(zeros[0:nWrite])
+		if err != nil {
+			return err
+		}
+
+		remainingWrite -= nWrite
 	}
+	return nil
+}
+
+func DownloadChunk(file *File, fp *os.File, offset int, size int, chunkWg *sync.WaitGroup, fileLock *sync.Mutex) {
+	newOffset := offset
+
+	// Creating a custom request because it will have Range header in it
+	req, _ := http.NewRequest("GET", file.DownloadUrl(), nil)
 
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+size)
 	req.Header.Add("Range", rangeHeader)
-	log.Println(rangeHeader)
-	log.Println(req.Header)
 
 	// http.DefaultClient does not copy headers while following redirects
 	client := &http.Client{
@@ -176,7 +211,8 @@ func DownloadChunk(file *File, fp *os.File, offset int, size int, chunkWg *sync.
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Fatal(err)
+		log.Println(err)
+		go DownloadChunk(file, fp, offset, size, chunkWg, fileLock)
 	}
 	defer resp.Body.Close()
 
@@ -184,17 +220,19 @@ func DownloadChunk(file *File, fp *os.File, offset int, size int, chunkWg *sync.
 	for {
 		nr, er := resp.Body.Read(buffer)
 		if nr > 0 {
+			// Using lock to not mix up the writes
 			fileLock.Lock()
 			fp.Seek(int64(offset), os.SEEK_SET)
 			nw, ew := fp.Write(buffer[0:nr])
 			fileLock.Unlock()
-			offset += nw
+			newOffset += nw
 			if ew != nil {
-				log.Fatal(ew)
+				log.Println(ew)
+				written := newOffset - offset
+				go DownloadChunk(file, fp, newOffset, size-written, chunkWg, fileLock)
 			}
 		}
 		if er == io.EOF {
-			log.Println("Seen EOF")
 			break
 		}
 		if er != nil {
@@ -202,72 +240,80 @@ func DownloadChunk(file *File, fp *os.File, offset int, size int, chunkWg *sync.
 			break
 		}
 	}
+	chunkWg.Done()
 }
 
-func FillWithZeros(fp *os.File, remainingWrite int) {
-	var write int
-	chunkSize := 3 * 1024
-	zeros := make([]byte, chunkSize)
-	for remainingWrite > 0 {
-		if remainingWrite < chunkSize {
-			write = remainingWrite
-		} else {
-			write = chunkSize
-		}
-		fp.Write(zeros[0:write])
-		remainingWrite -= write
-	}
-}
+func DownloadFile(file File, path string) error {
+	log.Println("Downloading:", file.Name)
 
-func DownloadFile(file *File, path string) {
 	// Creating a waitgroup to wait for all chunks to be
-	// downloaded before exiting
+	// downloaded before returning
 	var chunkWg sync.WaitGroup
+
+	// Creating a lock for file so that writes from different
+	// chunk downloaders do not mix
 	var fileLock sync.Mutex
 
+	// Creating the file under a temporary name for download
 	fp, err := os.Create(path + DownloadExtension)
 	if err != nil {
-		log.Fatal(err)
+		log.Println(err)
+		return err
 	}
+	defer fp.Close()
 
 	// Allocating space for the file
-	FillWithZeros(fp, file.Size)
+	err = FillWithZeros(fp, file.Size)
+	if err != nil {
+		log.Println(err)
+		return err
+	}
 
 	chunkSize := file.Size / MaxConnection
 	excessBytes := file.Size % MaxConnection
 
-	log.Println("Chunk size:", chunkSize, "Excess:", excessBytes)
-
 	offset := 0
 	chunkWg.Add(MaxConnection)
-	for i := MaxConnection; i > 0; i-- {
-		if i == 1 {
+	for i := 0; i < MaxConnection; i++ {
+		if i == MaxConnection-1 {
 			// Add excess bytes to last connection
 			chunkSize += excessBytes
 		}
-		go DownloadChunk(file, fp, offset, chunkSize, &chunkWg, &fileLock)
+		go DownloadChunk(&file, fp, offset, chunkSize, &chunkWg, &fileLock)
 		offset += chunkSize
 	}
+
+	// Waiting for all chunks to be downloaded
 	chunkWg.Wait()
 
+	// Renaming the file to correct path
 	fp.Close()
-	er := os.Rename(path+DownloadExtension, path)
-	if er != nil {
-		log.Fatal(err)
+	err = os.Rename(path+DownloadExtension, path)
+	if err != nil {
+		log.Println(err)
+		return err
 	}
 
-	log.Println("Download completed")
+	log.Println("Download completed:", file.Name)
+	return nil
 }
 
 func main() {
+	log.Println("Starting...")
 	flag.Parse()
-	RemoteFolderId := GetRemoteFolderId()
+
+	RemoteFolderId, err := GetRemoteFolderId()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// If local folder path is left at default value, find os users home directory
+	// and name "Putio Folder" as the local folder path under it
 	if *LocalFolderPath == "home/Putio Desktop" {
 		user, _ := user.Current()
 		defaultPath := path.Join(user.HomeDir, "Putio Desktop")
 		LocalFolderPath = &defaultPath
 	}
-	log.Println("Starting...")
 
 	for {
 		go WalkAndDownload(RemoteFolderId, *LocalFolderPath)
