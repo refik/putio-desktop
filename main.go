@@ -25,8 +25,9 @@ var LocalFolderPath = flag.String("local-path", "home/Putio Desktop", "local fol
 var CheckInterval = flag.Int("check-minutes", 10, "check interval of remote files in put.io")
 
 const ApiUrl = "https://api.put.io/v2/"
-const DownloadExtension = ".putio-desktop"
+const DownloadExtension = ".ptdownload"
 const MaxConnection = 10
+const ChunkSize int64 = 32 * 1024
 
 // Globals
 
@@ -46,7 +47,7 @@ type File struct {
 	Id          int    `json:"id"`
 	Name        string `json:"name"`
 	ContentType string `json:"content_type"`
-	Size        int    `json:"size"`
+	Size        int64  `json:"size"`
 }
 
 func (file *File) DownloadUrl() string {
@@ -170,16 +171,15 @@ func WalkAndDownload(parentId int, folderPath string) {
 
 // Local file operations
 
-func FillWithZeros(fp *os.File, remainingWrite int) error {
-	var nWrite int // Next chunk size to write
-	chunkSize := 3 * 1024
-	zeros := make([]byte, chunkSize)
+func FillWithZeros(fp *os.File, remainingWrite int64) error {
+	var nWrite int64 // Next chunk size to write
+	zeros := make([]byte, ChunkSize)
 	for remainingWrite > 0 {
 		// Checking whether there is less to write than chunkSize
-		if remainingWrite < chunkSize {
+		if remainingWrite < ChunkSize {
 			nWrite = remainingWrite
 		} else {
-			nWrite = chunkSize
+			nWrite = ChunkSize
 		}
 
 		_, err := fp.Write(zeros[0:nWrite])
@@ -192,14 +192,17 @@ func FillWithZeros(fp *os.File, remainingWrite int) error {
 	return nil
 }
 
-func DownloadChunk(file *File, fp *os.File, offset int, size int, chunkWg *sync.WaitGroup, fileLock *sync.Mutex) {
+// Downloads the given range. In case of an error, sleeps for 10s and tries again.
+func DownloadRange(file *File, fp *os.File, offset int64, size int64, chunkWg *sync.WaitGroup) {
+	defer chunkWg.Done()
 	newOffset := offset
 
 	retry := func(err error) {
-		chunkWg.Add(1)
-		log.Println(err)
+		time.Sleep(10 * time.Second)
+		log.Println(err, "Retrying in 10s...")
 		written := newOffset - offset
-		go DownloadChunk(file, fp, newOffset, size-written, chunkWg, fileLock)
+		chunkWg.Add(1)
+		go DownloadRange(file, fp, newOffset, size-written, chunkWg)
 	}
 
 	// Creating a custom request because it will have Range header in it
@@ -218,24 +221,20 @@ func DownloadChunk(file *File, fp *os.File, offset int, size int, chunkWg *sync.
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Println(err)
-		go DownloadChunk(file, fp, offset, size, chunkWg, fileLock)
+		retry(err)
+		return
 	}
 	defer resp.Body.Close()
 
-	buffer := make([]byte, 32*1024)
+	buffer := make([]byte, ChunkSize)
 	for {
 		nr, er := resp.Body.Read(buffer)
 		if nr > 0 {
-			// Using lock to not mix up the writes
-			fileLock.Lock()
-			fp.Seek(int64(offset), os.SEEK_SET)
-			nw, ew := fp.Write(buffer[0:nr])
-			fileLock.Unlock()
-			newOffset += nw
+			nw, ew := fp.WriteAt(buffer[0:nr], newOffset)
+			newOffset += int64(nw)
 			if ew != nil {
 				retry(ew)
-				break
+				return
 			}
 		}
 		if er == io.EOF {
@@ -243,10 +242,9 @@ func DownloadChunk(file *File, fp *os.File, offset int, size int, chunkWg *sync.
 		}
 		if er != nil {
 			retry(er)
-			break
+			return
 		}
 	}
-	chunkWg.Done()
 }
 
 func DownloadFile(file File, path string) error {
@@ -255,10 +253,6 @@ func DownloadFile(file File, path string) error {
 	// Creating a waitgroup to wait for all chunks to be
 	// downloaded before returning
 	var chunkWg sync.WaitGroup
-
-	// Creating a lock for file so that writes from different
-	// chunk downloaders do not mix
-	var fileLock sync.Mutex
 
 	// Creating the file under a temporary name for download
 	fp, err := os.Create(path + DownloadExtension)
@@ -278,14 +272,14 @@ func DownloadFile(file File, path string) error {
 	chunkSize := file.Size / MaxConnection
 	excessBytes := file.Size % MaxConnection
 
-	offset := 0
+	offset := int64(0)
 	chunkWg.Add(MaxConnection)
 	for i := 0; i < MaxConnection; i++ {
 		if i == MaxConnection-1 {
 			// Add excess bytes to last connection
 			chunkSize += excessBytes
 		}
-		go DownloadChunk(&file, fp, offset, chunkSize, &chunkWg, &fileLock)
+		go DownloadRange(&file, fp, offset, chunkSize, &chunkWg)
 		offset += chunkSize
 	}
 
