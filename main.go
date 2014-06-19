@@ -139,7 +139,7 @@ func FilesListRequest(parentId int) (files []File, err error) {
 }
 
 func WalkAndDownload(parentId int, folderPath string) {
-	log.Println("Walking in", folderPath)
+	log.Println("Walking in:", folderPath)
 
 	// Creating if the folder is absent
 	if _, err := os.Stat(folderPath); err != nil {
@@ -198,8 +198,8 @@ func DownloadRange(file *File, fp *os.File, offset int64, size int64, chunkWg *s
 	newOffset := offset
 
 	retry := func(err error) {
-		time.Sleep(10 * time.Second)
 		log.Println(err, "Retrying in 10s...")
+		time.Sleep(10 * time.Second)
 		written := newOffset - offset
 		chunkWg.Add(1)
 		go DownloadRange(file, fp, newOffset, size-written, chunkWg)
@@ -228,7 +228,7 @@ func DownloadRange(file *File, fp *os.File, offset int64, size int64, chunkWg *s
 
 	buffer := make([]byte, ChunkSize)
 	for {
-		nr, er := resp.Body.Read(buffer)
+		nr, er := io.ReadFull(resp.Body, buffer)
 		if nr > 0 {
 			nw, ew := fp.WriteAt(buffer[0:nr], newOffset)
 			newOffset += int64(nw)
@@ -237,8 +237,8 @@ func DownloadRange(file *File, fp *os.File, offset int64, size int64, chunkWg *s
 				return
 			}
 		}
-		if er == io.EOF {
-			break
+		if er == io.EOF || er == io.ErrUnexpectedEOF {
+			return
 		}
 		if er != nil {
 			retry(er)
