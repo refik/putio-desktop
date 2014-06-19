@@ -307,7 +307,7 @@ func DownloadFile(file File, path string) error {
 	// Renaming the file to correct path
 	fp.Truncate(file.Size)
 	fp.Close()
-	err := os.Rename(path+DownloadExtension, path)
+	err := os.Rename(downloadPath, path)
 	if err != nil {
 		log.Println(err)
 		return err
