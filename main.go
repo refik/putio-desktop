@@ -299,8 +299,11 @@ func DownloadFile(file File, path string, runWg *sync.WaitGroup, reportCh chan R
 			if err == nil {
 				// This range in not finished yet
 				zByteIndex := zIndex * ChunkSize
-				rangeCustomSize -= zByteIndex - rangeCustomOffset
-				rangeCustomOffset = zByteIndex
+				if zByteIndex > rangeCustomOffset {
+					rangeCustomSize -= zByteIndex - rangeCustomOffset
+					rangeCustomOffset = zByteIndex
+				}
+
 			} else {
 				continue
 			}
