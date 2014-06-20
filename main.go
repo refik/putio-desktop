@@ -22,8 +22,8 @@ import (
 
 var RemoteFolderName = flag.String("putio-folder", "Putio Desktop", "putio folder name under your root")
 var AccessToken = flag.String("oauth-token", "", "Oauth Token")
-var LocalFolderPath = flag.String("local-path", "home/Putio Desktop", "local folder to fetch")
-var CheckInterval = flag.Int("check-minutes", 10, "check interval of remote files in put.io")
+var LocalFolderPath = flag.String("local-path", "~/Putio Desktop", "local folder to fetch")
+var CheckInterval = flag.Int("check-minutes", 5, "check interval of remote files in put.io")
 
 const ApiUrl = "https://api.put.io/v2/"
 const DownloadExtension = ".ptdownload"
@@ -141,7 +141,8 @@ func FilesListRequest(parentId int) (files []File, err error) {
 
 // Download functions
 
-func WalkAndDownload(parentId int, folderPath string) {
+func WalkAndDownload(parentId int, folderPath string, runWg *sync.WaitGroup, reportCh chan Report) {
+	defer runWg.Done()
 	log.Println("Walking in:", folderPath)
 
 	// Creating if the folder is absent
@@ -163,32 +164,30 @@ func WalkAndDownload(parentId int, folderPath string) {
 	for _, file := range files {
 		path := path.Join(folderPath, file.Name)
 		if file.ContentType == "application/x-directory" {
-			go WalkAndDownload(file.Id, path)
+			runWg.Add(1)
+			go WalkAndDownload(file.Id, path, runWg, reportCh)
 		} else {
+			reportCh <- Report{FilesSize: file.Size}
 			if _, err := os.Stat(path); err != nil {
-				go DownloadFile(file, path)
+				runWg.Add(1)
+				go DownloadFile(file, path, runWg, reportCh)
 			}
 		}
 	}
 }
 
 // Downloads the given range. In case of an error, sleeps for 10s and tries again.
-func DownloadRange(file *File, fp *os.File, offset int64, size int64, rangeWg *sync.WaitGroup, chunkIndex bitField) {
+func DownloadRange(file *File, fp *os.File, offset int64, size int64, rangeWg *sync.WaitGroup, chunkIndex bitField, reportCh chan Report) {
 	defer rangeWg.Done()
+	reportCh <- Report{ToDownload: size}
 	newOffset := offset
-
-	retry := func(err error) {
-		log.Println(err, "Retrying in 10s...")
-		time.Sleep(10 * time.Second)
-		written := newOffset - offset
-		rangeWg.Add(1)
-		go DownloadRange(file, fp, newOffset, size-written, rangeWg, chunkIndex)
-	}
+	lastByte := offset + size           // The byte we won't be getting
+	lastIndex := lastByte/ChunkSize - 1 // The last index we'll fill
 
 	// Creating a custom request because it will have Range header in it
 	req, _ := http.NewRequest("GET", file.DownloadUrl(), nil)
 
-	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+size)
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, lastByte-1)
 	req.Header.Add("Range", rangeHeader)
 
 	// http.DefaultClient does not copy headers while following redirects
@@ -201,7 +200,7 @@ func DownloadRange(file *File, fp *os.File, offset int64, size int64, rangeWg *s
 
 	resp, err := client.Do(req)
 	if err != nil {
-		retry(err)
+		log.Println(err)
 		return
 	}
 	defer resp.Body.Close()
@@ -211,12 +210,18 @@ func DownloadRange(file *File, fp *os.File, offset int64, size int64, rangeWg *s
 		nr, er := io.ReadFull(resp.Body, buffer)
 		if nr > 0 {
 			nw, ew := fp.WriteAt(buffer[0:nr], newOffset)
-			newOffset += int64(nw)
-			chunkIndex.Set(newOffset/ChunkSize - 1)
-			fp.WriteAt(chunkIndex, file.Size)
+			nWritten := int64(nw)
+			newOffset += nWritten
+			currentIndex := newOffset/ChunkSize - 1
+			if currentIndex == lastIndex && newOffset != lastByte {
+				// dont mark the last bit done without finishing the whole range
+			} else {
+				chunkIndex.Set(currentIndex)
+				fp.WriteAt(chunkIndex, file.Size)
+			}
+			reportCh <- Report{Downloaded: nWritten}
 			if ew != nil {
-				log.Println(newOffset)
-				retry(ew)
+				log.Println(ew)
 				return
 			}
 		}
@@ -224,15 +229,16 @@ func DownloadRange(file *File, fp *os.File, offset int64, size int64, rangeWg *s
 			return
 		}
 		if er != nil {
-			retry(er)
+			log.Println(er)
 			return
 		}
 	}
 }
 
-func DownloadFile(file File, path string) error {
+func DownloadFile(file File, path string, runWg *sync.WaitGroup, reportCh chan Report) error {
+	defer runWg.Done()
 	downloadPath := path + DownloadExtension
-	chunkIndex := bitField(make([]byte, file.Size/ChunkSize+1))
+	chunkIndex := bitField(make([]byte, file.Size/ChunkSize/8+1))
 	resume := false
 	var fp *os.File
 
@@ -258,6 +264,7 @@ func DownloadFile(file File, path string) error {
 		}
 	} else {
 		log.Println("Resuming:", file.Name)
+		resume = true
 		fp, err = os.OpenFile(downloadPath, os.O_RDWR, 0755)
 		if err != nil {
 			log.Println(err)
@@ -275,39 +282,49 @@ func DownloadFile(file File, path string) error {
 	excessBytes := file.Size % MaxConnection
 
 	offset := int64(0)
-	rangeWg.Add(MaxConnection)
 	for i := 0; i < MaxConnection; i++ {
+		rangeCustomOffset := offset
+		offset += rangeSize
+		rangeCustomSize := rangeSize
 		if i == MaxConnection-1 {
 			// Add excess bytes to last connection
-			rangeSize += excessBytes
+			rangeCustomSize = rangeSize + excessBytes
 		}
 		if resume {
 			// Adjusting range for previously downloaded file
-			startIndex := offset / ChunkSize
-			limitIndex := (offset + rangeSize) / ChunkSize
+			startIndex := rangeCustomOffset / ChunkSize
+			limitIndex := (rangeCustomOffset + rangeSize) / ChunkSize
 
 			zIndex, err := chunkIndex.GetFirstZeroIndex(startIndex, limitIndex)
-			if err != nil {
+			if err == nil {
+				// This range in not finished yet
 				zByteIndex := zIndex * ChunkSize
-				previouslyDownloaded := zByteIndex - offset
-				remaining := rangeSize - previouslyDownloaded
-				newRangeSize := remaining - (remaining % ChunkSize)
-				go DownloadRange(&file, fp, zByteIndex, newRangeSize, &rangeWg, chunkIndex)
+				rangeCustomSize -= zByteIndex - rangeCustomOffset
+				rangeCustomOffset = zByteIndex
+			} else {
+				continue
 			}
-		} else {
-
-			go DownloadRange(&file, fp, offset, rangeSize, &rangeWg, chunkIndex)
 		}
-		offset += rangeSize
+		rangeWg.Add(1)
+		go DownloadRange(&file, fp, rangeCustomOffset, rangeCustomSize, &rangeWg, chunkIndex, reportCh)
 	}
 
 	// Waiting for all chunks to be downloaded
 	rangeWg.Wait()
 
+	// Verifying the download, some ranges may not be finished
+	_, err := chunkIndex.GetFirstZeroIndex(0, file.Size/ChunkSize)
+	if err == nil {
+		// All chunks are not downloaded
+		log.Println("All chunks are not downloaded, closing file for dowload:", file.Name)
+		fp.Close()
+		return nil
+	}
+
 	// Renaming the file to correct path
 	fp.Truncate(file.Size)
 	fp.Close()
-	err := os.Rename(downloadPath, path)
+	err = os.Rename(downloadPath, path)
 	if err != nil {
 		log.Println(err)
 		return err
@@ -365,6 +382,45 @@ func (b bitField) GetFirstZeroIndex(offset, limit int64) (int64, error) {
 
 func divMod(a, b int64) (int64, int64) { return a / b, a % b }
 
+func StartWalkAndDownloadClearReports(RemoteFolderId int, reportCh chan Report) {
+	var runWg sync.WaitGroup
+	runWg.Add(1)
+	go WalkAndDownload(RemoteFolderId, *LocalFolderPath, &runWg, reportCh)
+	runWg.Wait()
+}
+
+type Report struct {
+	Downloaded int64
+	ToDownload int64
+	FilesSize  int64
+}
+
+func Reporter(reportCh chan Report) {
+	log.Println("Reporter started")
+
+	var (
+		totalDownloaded int64
+		totalToDownload int64
+		totalFilesSize  int64
+	)
+
+	for report := range reportCh {
+		totalDownloaded += report.Downloaded
+		totalToDownload += report.ToDownload
+		totalFilesSize += report.FilesSize
+		remainingDownload := totalToDownload - totalDownloaded
+		syncPercentage := 100 - (float32(remainingDownload) / float32(totalFilesSize) * 100)
+		completePercentage := float32(totalDownloaded) / float32(totalToDownload) * 100
+		fmt.Printf("Downloads: %% %3.0f  -  Sync: %% %6.2f\r", completePercentage, syncPercentage)
+	}
+}
+
+func StartReporter() chan Report {
+	reportCh := make(chan Report)
+	go Reporter(reportCh)
+	return reportCh
+}
+
 func main() {
 	log.Println("Starting...")
 	flag.Parse()
@@ -376,14 +432,17 @@ func main() {
 
 	// If local folder path is left at default value, find os users home directory
 	// and name "Putio Folder" as the local folder path under it
-	if *LocalFolderPath == "home/Putio Desktop" {
+	if *LocalFolderPath == "~/Putio Desktop" {
 		user, _ := user.Current()
 		defaultPath := path.Join(user.HomeDir, "Putio Desktop")
 		LocalFolderPath = &defaultPath
 	}
 
+	reportCh := StartReporter()
+
 	for {
-		go WalkAndDownload(RemoteFolderId, *LocalFolderPath)
+		log.Println("Started syncing...")
+		StartWalkAndDownloadClearReports(RemoteFolderId, reportCh)
 		time.Sleep(time.Duration(*CheckInterval) * time.Minute)
 	}
 
