@@ -20,19 +20,28 @@ import (
 
 // Settings
 
-var RemoteFolderName = flag.String("putio-folder", "Putio Desktop", "putio folder name under your root")
-var AccessToken = flag.String("oauth-token", "", "Oauth Token")
-var LocalFolderPath = flag.String("local-path", "~/Putio Desktop", "local folder to fetch")
-var CheckInterval = flag.Int("check-minutes", 5, "check interval of remote files in put.io")
+var (
+	RemoteFolderName = flag.String("putio-folder", "Putio Desktop", "putio folder name under your root")
+	AccessToken      = flag.String("oauth-token", "", "Oauth Token")
+	LocalFolderPath  = flag.String("local-path", "~/Putio Desktop", "local folder to fetch")
+	CheckInterval    = flag.Int("check-minutes", 5, "check interval of remote files in put.io")
+)
 
-const ApiUrl = "https://api.put.io/v2/"
-const DownloadExtension = ".ptdownload"
-const MaxConnection = 5
-const ChunkSize int64 = 32 * 1024
+const (
+	ApiUrl                  = "https://api.put.io/v2/"
+	DownloadExtension       = ".ptdownload"
+	MaxConnection           = 5
+	ChunkSize         int64 = 32 * 1024
+)
 
 // Globals
 
-var RemoteFolderId int
+var (
+	RemoteFolderId  int
+	TotalDownloaded int64
+	TotalToDownload int64
+	TotalFilesSize  int64
+)
 
 // Putio api response types
 
@@ -386,6 +395,9 @@ func (b bitField) GetFirstZeroIndex(offset, limit int64) (int64, error) {
 func divMod(a, b int64) (int64, int64) { return a / b, a % b }
 
 func StartWalkAndDownloadClearReports(RemoteFolderId int, reportCh chan Report) {
+	TotalFilesSize = 0
+	TotalDownloaded = 0
+	TotalToDownload = 0
 	var runWg sync.WaitGroup
 	runWg.Add(1)
 	go WalkAndDownload(RemoteFolderId, *LocalFolderPath, &runWg, reportCh)
@@ -398,23 +410,38 @@ type Report struct {
 	FilesSize  int64
 }
 
+func HumanReadableSpeed(bytePerSec float64) string {
+	if bytePerSec > 1024*1024 {
+		return fmt.Sprintf("%5.2f MB/s", bytePerSec/(1024*1024))
+	} else if bytePerSec > 1024 {
+		return fmt.Sprintf("%5.1f KB/s", bytePerSec/1024)
+	} else {
+		return fmt.Sprintf("%5.0f B/s ", bytePerSec)
+	}
+}
+
 func Reporter(reportCh chan Report) {
+	lastRecordedTime := time.Now()
+	lastRecordedTotalDownloaded := int64(0)
+	minReportTime := 1 * time.Second
 	log.Println("Reporter started")
 
-	var (
-		totalDownloaded int64
-		totalToDownload int64
-		totalFilesSize  int64
-	)
-
 	for report := range reportCh {
-		totalDownloaded += report.Downloaded
-		totalToDownload += report.ToDownload
-		totalFilesSize += report.FilesSize
-		remainingDownload := totalToDownload - totalDownloaded
-		syncPercentage := 100 - (float32(remainingDownload) / float32(totalFilesSize) * 100)
-		completePercentage := float32(totalDownloaded) / float32(totalToDownload) * 100
-		fmt.Printf("Downloads: %% %3.0f  -  Sync: %% %6.2f\r", completePercentage, syncPercentage)
+		TotalDownloaded += report.Downloaded
+		TotalToDownload += report.ToDownload
+		TotalFilesSize += report.FilesSize
+		currentTime := time.Now()
+		lastReportTimeDifference := currentTime.Sub(lastRecordedTime)
+		if lastReportTimeDifference > minReportTime {
+			remainingDownload := TotalToDownload - TotalDownloaded
+			syncPercentage := 100 - (float32(remainingDownload) / float32(TotalFilesSize) * 100)
+			completePercentage := float32(TotalDownloaded) / float32(TotalToDownload) * 100
+			speed := (float64(TotalDownloaded) - float64(lastRecordedTotalDownloaded)) / lastReportTimeDifference.Seconds()
+			fmt.Printf("[ Downloads %% %2.0f - %s ]   [ Sync: %% %5.2f ]\r", completePercentage, HumanReadableSpeed(speed), syncPercentage)
+			lastRecordedTime = currentTime
+			lastRecordedTotalDownloaded = TotalDownloaded
+		}
+
 	}
 }
 
