@@ -1,6 +1,6 @@
 # Putio Desktop Client
 
-This program periodically checks a folder in your put.io account. It creates the same folder, file structure in your computer. Download are done with multiple connections and this makes it fast.
+This program periodically checks a folder in your put.io account. It creates the same folder, file structure in your computer. Downloads are done with multiple connections and this makes it fast.
 
 ## How to use
 
